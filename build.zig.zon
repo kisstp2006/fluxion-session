@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+.{
+    .name = .fluxion_session,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xca58f2d997cde18c,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}

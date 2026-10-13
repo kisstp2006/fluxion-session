@@ -1,0 +1,4 @@
+# Every text file is LF in the repository and in a checkout: a package's hash
+# is taken over its files, so a CRLF checkout of a file would hash as a
+# different package from the one the pins name.
+* text=auto eol=lf
