@@ -106,6 +106,7 @@ pub const Network = struct {
     now: u64 = 0,
     in_flight: std.ArrayList(Flying) = .empty,
     endpoints: std.ArrayList(*Endpoint) = .empty,
+    boxes: std.ArrayList(*Box) = .empty,
     sent: u64 = 0,
     lost: u64 = 0,
     bytes: u64 = 0,
@@ -128,6 +129,8 @@ pub const Network = struct {
     pub const Endpoint = struct {
         network: *Network,
         address: Address,
+        /// The NAT it is behind, if any: `address` its own, inside.
+        box: ?*Box = null,
 
         pub fn transport(self: *Endpoint) Transport {
             return .{ .ptr = self, .vtable = &.{ .send = send, .receive = receive } };
@@ -135,12 +138,85 @@ pub const Network = struct {
 
         fn send(ptr: *anyopaque, to: *const Address, data: []const u8) void {
             const self: *Endpoint = @ptrCast(@alignCast(ptr));
-            self.network.carry(self.address, to.*, data);
+            const from = if (self.box) |box| box.outward(self.address, to.*) orelse return else self.address;
+            self.network.carry(from, to.*, data);
         }
 
         fn receive(ptr: *anyopaque, buffer: []u8) ?Datagram {
             const self: *Endpoint = @ptrCast(@alignCast(ptr));
-            return self.network.take(self.address, buffer);
+            return self.network.take(self, buffer);
+        }
+    };
+
+    /// How a NAT maps those behind it, as RFC 4787 sorts them.
+    pub const NatKind = enum {
+        /// One port outside for each endpoint inside, open to anyone once
+        /// it has sent anything.
+        full_cone,
+        /// One port outside for each endpoint inside, open only to the
+        /// addresses it has sent to: what most home routers are.
+        restricted,
+        /// A new port outside for each address an endpoint sends to, open
+        /// only to that address: what no opening datagram gets through.
+        symmetric,
+    };
+
+    /// A NAT: the address the world sees those behind it at, and its ports.
+    pub const Box = struct {
+        gpa: std.mem.Allocator,
+        kind: NatKind,
+        outside: [4]u8,
+        next_port: u16 = 50000,
+        mappings: std.ArrayList(Mapping) = .empty,
+        permits: std.ArrayList(Permit) = .empty,
+
+        const Mapping = struct { inside: Address, remote: ?Address, port: u16 };
+        const Permit = struct { inside: Address, remote: Address };
+
+        fn deinit(self: *Box) void {
+            self.mappings.deinit(self.gpa);
+            self.permits.deinit(self.gpa);
+        }
+
+        /// The address a datagram from `inside` to `to` leaves at; its way
+        /// back opened as the kind of NAT opens it.
+        fn outward(self: *Box, inside: Address, to: Address) ?Address {
+            const remote: ?Address = if (self.kind == .symmetric) to else null;
+            const port = for (self.mappings.items) |held| {
+                if (!held.inside.eql(&inside)) continue;
+                if (remote) |wanted| {
+                    if (!held.remote.?.eql(&wanted)) continue;
+                }
+                break held.port;
+            } else made: {
+                const port = self.next_port;
+                self.next_port += 1;
+                self.mappings.append(self.gpa, .{ .inside = inside, .remote = remote, .port = port }) catch return null;
+                break :made port;
+            };
+            const known = for (self.permits.items) |held| {
+                if (held.inside.eql(&inside) and held.remote.eql(&to)) break true;
+            } else false;
+            if (!known) self.permits.append(self.gpa, .{ .inside = inside, .remote = to }) catch return null;
+            return .{ .ip4 = .{ .bytes = self.outside, .port = port } };
+        }
+
+        /// Whether a datagram from `from` to `to`, outside, reaches
+        /// `inside`.
+        fn lets(self: *const Box, inside: Address, from: Address, to: Address) bool {
+            for (self.mappings.items) |held| {
+                if (!held.inside.eql(&inside)) continue;
+                const at: Address = .{ .ip4 = .{ .bytes = self.outside, .port = held.port } };
+                if (!at.eql(&to)) continue;
+                switch (self.kind) {
+                    .full_cone => return true,
+                    .symmetric => return held.remote.?.eql(&from),
+                    .restricted => for (self.permits.items) |permit| {
+                        if (permit.inside.eql(&inside) and permit.remote.eql(&from)) return true;
+                    },
+                }
+            }
+            return false;
         }
     };
 
@@ -153,6 +229,28 @@ pub const Network = struct {
         self.in_flight.deinit(self.gpa);
         for (self.endpoints.items) |made| self.gpa.destroy(made);
         self.endpoints.deinit(self.gpa);
+        for (self.boxes.items) |made| {
+            made.deinit();
+            self.gpa.destroy(made);
+        }
+        self.boxes.deinit(self.gpa);
+    }
+
+    /// A NAT of `kind`, the world seeing those behind it at `outside`.
+    pub fn nat(self: *Network, kind: NatKind, outside: [4]u8) !*Box {
+        const made = try self.gpa.create(Box);
+        errdefer self.gpa.destroy(made);
+        made.* = .{ .gpa = self.gpa, .kind = kind, .outside = outside };
+        try self.boxes.append(self.gpa, made);
+        return made;
+    }
+
+    /// An endpoint behind `box`, at 10.0.0.1:`port` inside it.
+    pub fn endpointBehind(self: *Network, box: *Box, port: u16) !*Endpoint {
+        const made = try self.endpoint(port);
+        made.address = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = port } };
+        made.box = box;
+        return made;
     }
 
     /// An endpoint at 127.0.0.1:`port`.
@@ -183,11 +281,14 @@ pub const Network = struct {
         }
     }
 
-    fn take(self: *Network, at: Address, buffer: []u8) ?Datagram {
-        // The one arrived first, of those for `at`.
+    fn take(self: *Network, end: *Endpoint, buffer: []u8) ?Datagram {
+        // The one arrived first, of those for `end` - through its NAT, those
+        // it lets in.
         var best: ?usize = null;
         for (self.in_flight.items, 0..) |flying, i| {
-            if (flying.arrives > self.now or !flying.to.eql(&at)) continue;
+            if (flying.arrives > self.now) continue;
+            const mine = if (end.box) |box| box.lets(end.address, flying.from, flying.to) else flying.to.eql(&end.address);
+            if (!mine) continue;
             if (best == null or flying.arrives < self.in_flight.items[best.?].arrives) best = i;
         }
         const i = best orelse return null;

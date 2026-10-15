@@ -58,6 +58,8 @@ The time passed in is nanoseconds of a clock that only goes forward. Nothing in 
 | `Connection` | One end of a session once the keys are agreed: channels, acknowledgements, round trip (`rtt_ns`), loss, the budget, and `stats`. |
 | `Channel` | `unreliable`: arrives or not, in any order. `sequenced`: arrives or not, never after a newer one. `reliable`: arrives once, in order; up to `max_message` (64 KiB), sent in pieces when larger than a datagram. |
 | `Browser` | Finds servers on a LAN: `search` to the broadcast address, `update`, then `found`, with each server's name, info, players and ping. |
+| `Rendezvous` | A rendezvous server, for a machine the internet reaches: servers say they are there and are given an id, players list them and are introduced, and it carries the sessions no NAT lets through. `zig build rendezvous` makes `fluxion-rendezvous [--port 27000]`. |
+| `Nat` | A game's way through NATs: a `Transport` over its socket's that a `Server` or `Client` is given. A server `register`s; a player `search`es, `introduce`s itself to one by id and joins `direct`, or `Nat.relayed(id)` where that does not open. |
 | `transport` | `Transport`, the two calls a session makes: send this there, and give me what has come without waiting. `Udp` is a socket. `Network` is a network in memory for tests, with latency, jitter, loss and duplication. |
 | `bits` | `Writer` and `Reader`: values of 1 to 64 bits, varints, quantized floats, angles at 16 bits. They build small messages; a message that lies about its length is refused. |
 | `Reason` | Why a session ended: `left`, `kicked`, `timed_out`, `server_closed`, `broken`, `full`, `refused`. |
@@ -72,6 +74,27 @@ A message received is good until the next `next`.
 - **Bounded.** Datagrams are 1200 bytes at most. A reliable message is at most `max_message`. At most `max_queued` reliable bytes wait to be sent. 256 reliable messages are in flight at a time, and a receiving end never holds more. An update takes a bounded number of datagrams. A peer that sends nonsense under a valid seal is disconnected as `broken`.
 - **Answers on the LAN are not sealed.** They are a list to pick from. Joining is what is sealed.
 
+## Across the internet
+
+A server behind a NAT is reached through a rendezvous server. The server says it is there every ten seconds, which keeps its NAT open to the rendezvous, and the rendezvous learns the address the world sees it at. A player asks for the servers of a game, and to be introduced to one: the rendezvous tells each the other's address, the server sends the player a few datagrams - which open its NAT to them - and the player joins it directly. Where two NATs give a new port for each address they send to, nothing opens: the player joins `Nat.relayed(id)` instead, and the rendezvous carries the session's datagrams between them, sealed end to end as ever, so it carries what it cannot read.
+
+```zig
+// The server: its socket's datagrams through `Nat` first.
+var nat: session.Nat = .init(gpa, socket.transport(), rendezvous_address, protocol, .{}, seed);
+var server: session.Server = try .init(gpa, io, nat.transport(), .{ .protocol = protocol });
+nat.register(now_ns, "My server", "de_dust2", players, 10);
+// Each tick: nat.update(now_ns) before server.update(now_ns).
+
+// The player: found, introduced, joined directly - or through the rendezvous.
+nat.search();                      // later: nat.found()
+nat.introduce(now_ns, id);         // later: nat.direct
+try client.connect(io, now_ns, nat.direct.?, "name");
+// Not joined in a few seconds:
+try client.connect(io, now_ns, session.Nat.relayed(id), "name");
+```
+
+The rendezvous keeps nothing for what asks but a server's own word and a player's relayed datagrams; it answers no more than it is asked, forgets a server not heard of for 30 seconds and a link unused for a minute, and carries at most 512 KiB a second each way for a player. `Network`, the network in memory, has NATs of the three kinds (`nat`, `endpointBehind`): full cone, port-restricted - most home routers - and symmetric; the tests join through each.
+
 ## Not yet
 
-These are planned in this order: NAT traversal through a rendezvous server, with hole punching and a relay for peers that cannot reach each other; and a browser transport.
+A browser transport.

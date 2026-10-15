@@ -8,6 +8,9 @@ pub const Server = @import("Server.zig");
 pub const Client = @import("Client.zig");
 pub const Connection = @import("Connection.zig");
 pub const Browser = @import("Browser.zig");
+pub const Rendezvous = @import("Rendezvous.zig");
+pub const Nat = @import("Nat.zig");
+pub const rendezvous = @import("rendezvous.zig");
 pub const Channel = Connection.Channel;
 pub const Reason = wire.Reason;
 
@@ -22,4 +25,5 @@ pub const wire = @import("wire.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("session_test.zig");
+    _ = @import("nat_test.zig");
 }
