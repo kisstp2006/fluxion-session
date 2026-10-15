@@ -27,13 +27,13 @@ pub const ReplayWindow = struct {
     /// taken before.
     pub fn fresh(self: *const ReplayWindow, number: u64) bool {
         if (number + size <= self.newest) return false;
-        return self.seen[number % size] != number;
+        return self.seen[@intCast(number % size)] != number;
     }
 
     /// `number` taken. Only after its packet was found genuine.
     pub fn take(self: *ReplayWindow, number: u64) void {
         if (number > self.newest) self.newest = number;
-        self.seen[number % size] = number;
+        self.seen[@intCast(number % size)] = number;
     }
 };
 

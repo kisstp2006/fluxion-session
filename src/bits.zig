@@ -153,8 +153,9 @@ pub const Reader = struct {
     /// Bytes a `Writer.bytes` wrote, no more than `most`: pointing into a
     /// copy made in `out`.
     pub fn bytes(self: *Reader, out: []u8, most: usize) Error![]u8 {
-        const len = try self.varint();
-        if (len > most or len > out.len) return error.Overflow;
+        const told = try self.varint();
+        if (told > most or told > out.len) return error.Overflow;
+        const len: usize = @intCast(told);
         for (out[0..len]) |*byte| byte.* = @intCast(try self.bits(8));
         return out[0..len];
     }
